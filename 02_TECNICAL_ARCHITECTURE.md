@@ -1,6 +1,6 @@
 # Technical Architecture Documentation
 
-## Sistema Abuelo Cómodo v2.0
+## Sistema Abuelo Comodo v2.0
 
 ---
 
@@ -32,52 +32,95 @@ The system operates within an ecosystem of interconnected platforms, each servin
 
 ## Data Flow Architecture
 
-### Order Creation Pipeline
+### Order Creation Pipeline (Shopify to Supabase)
 
 When a customer completes a purchase on Shopify, the platform dispatches a webhook to the Supabase Edge Function endpoint. The processing sequence unfolds as follows:
 
 ```
 SHOPIFY (orders/create webhook)
-    │
-    ▼
+    |
+    v
 EDGE FUNCTION: shopify-webhook
-    │
-    ├── Validate payload structure
-    ├── Check idempotency (existing order?)
-    ├── Find or create customer record
-    ├── Map Shopify location to internal location_id
-    ├── INSERT into orders table
-    │
-    ▼
+    |
+    |-- Validate payload structure
+    |-- Check idempotency (existing order?)
+    |-- Find or create customer record
+    |-- Map Shopify location to internal location_id
+    |-- INSERT into orders table
+    |
+    v
 FOR EACH line_item:
-    │
-    ├── Validate product exists (by SKU)
-    ├── INSERT into order_items table
-    │       │
-    │       ▼
-    │   TRIGGER: trigger_auto_process_recipes
-    │       │
-    │       ├── Query product_recipes for components
-    │       ├── INSERT into order_item_elements (per component)
-    │       │
-    │       ▼
-    │   TRIGGER: trg_update_reserved_on_order
-    │       │
-    │       ├── UPDATE inventory (reserve main product)
-    │       ├── UPDATE inventory (reserve each component)
-    │       │
-    │       ▼
-    │   TRIGGER: trigger_generate_accounting
-    │       │
-    │       ├── Determine order type and category
-    │       ├── Query matching accounting_rules
-    │       ├── INSERT into accounting_entries (per rule)
-    │
-    ▼
+    |
+    |-- Validate product exists (by SKU)
+    |-- INSERT into order_items table
+    |       |
+    |       v
+    |   TRIGGER: trigger_auto_process_recipes
+    |       |
+    |       |-- Query product_recipes for components
+    |       |-- INSERT into order_item_elements (per component)
+    |       |
+    |       v
+    |   TRIGGER: trg_update_reserved_on_order
+    |       |
+    |       |-- UPDATE inventory (reserve main product)
+    |       |-- UPDATE inventory (reserve each component)
+    |       |
+    |       v
+    |   TRIGGER: trigger_generate_accounting
+    |       |
+    |       |-- Determine order type and category
+    |       |-- Query matching accounting_rules
+    |       |-- INSERT into accounting_entries (per rule)
+    |
+    v
 RESPONSE: { success: true, order_id, items_processed }
 ```
 
 The entire pipeline executes within a single database transaction. Either all operations succeed, or none persist—eliminating the partial-state failures that plagued the polling-based legacy system.
+
+### Phone Order Pipeline (Supabase to Shopify)
+
+Phone orders created through AppSheet follow a reverse synchronization path, automatically pushing to Shopify for unified order management:
+
+```
+APPSHEET (Phone Order Creation)
+    |
+    v
+INSERT into orders table
+    |
+    v
+INSERT into order_items table
+    |
+    v
+TRIGGER: trg_auto_push_on_item_insert
+    |
+    |-- Verify source_type IN ('Telefonico', 'AppSheet')
+    |-- Verify shopify_order_id IS NULL
+    |-- Verify vendedor != 'Shopify'
+    |
+    v
+pg_net HTTP POST (async)
+    |
+    v
+EDGE FUNCTION: push-order-to-shopify
+    |
+    |-- Validate order exists and has items
+    |-- Check historical order safeguard (post 2025-11-28 only)
+    |-- Build Shopify order payload
+    |-- Format phone with +52 country code
+    |-- Create line items (variant_id or custom)
+    |-- POST to Shopify Admin API
+    |
+    v
+UPDATE orders SET
+    shopify_order_id = response.id,
+    shopify_order_number = response.order_number,
+    order_number = 'SHO-' || response.order_number,
+    uploaded_to_shopify = TRUE
+```
+
+This bidirectional synchronization ensures all orders—regardless of origin—appear in Shopify for unified fulfillment management.
 
 ### Order Fulfillment Pipeline
 
@@ -85,26 +128,26 @@ Shopify's fulfillment notification triggers a parallel processing path:
 
 ```
 SHOPIFY (orders/fulfilled webhook)
-    │
-    ▼
+    |
+    v
 EDGE FUNCTION: shopify-order-fulfilled
-    │
-    ├── Locate order by shopify_order_id
-    ├── UPDATE orders (fulfillment_status, warehouse_status)
-    │
-    ▼
+    |
+    |-- Locate order by shopify_order_id
+    |-- UPDATE orders (fulfillment_status, warehouse_status)
+    |
+    v
 FOR EACH fulfillment.line_item:
-    │
-    ├── Find order_item_id by SKU
-    ├── INSERT dispatch_record (main product)
-    ├── Query order_item_elements for components
-    │
-    ▼
+    |
+    |-- Find order_item_id by SKU
+    |-- INSERT dispatch_record (main product)
+    |-- Query order_item_elements for components
+    |
+    v
     FOR EACH component:
-        │
-        └── INSERT dispatch_record (component)
-    │
-    ▼
+        |
+        |-- INSERT dispatch_record (component)
+    |
+    v
 RESPONSE: { success: true, dispatch_records_created }
 ```
 
@@ -129,6 +172,7 @@ Triggers operate in defined sequences based on timing (BEFORE/AFTER) and event t
 | order_items | INSERT | AFTER | trigger_auto_process_recipes | trg_process_recipes_on_insert() |
 | order_items | INSERT | AFTER | trg_update_reserved_on_order | update_reserved_on_order() |
 | order_items | INSERT | AFTER | trigger_generate_accounting | trg_generate_accounting_entries() |
+| order_items | INSERT | AFTER | trg_auto_push_on_item_insert | notify_push_to_shopify_on_items() |
 | inventory_movements | INSERT | BEFORE | trg_update_inventory_from_movement | update_inventory_from_movement() |
 | purchase_order_items | INSERT | AFTER | trg_update_in_transit_on_po | update_in_transit_on_po() |
 | purchase_order_items | UPDATE | AFTER | trg_process_purchase_receipt | process_purchase_receipt() |
@@ -144,9 +188,11 @@ Triggers operate in defined sequences based on timing (BEFORE/AFTER) and event t
 
 **trg_process_recipes_on_insert()**: Expands composite products into component elements. Queries product_recipes where product_item_id matches the ordered item, filters by recipe_type = 'SALIDA' and location, then inserts corresponding records into order_item_elements with calculated quantities.
 
-**trg_generate_accounting_entries()**: Applies accounting rules based on order type (Venta, Garantía, Intercambio, Obsequio), product category, and location (sucursal). Supports multiple entries per order item when multiple rules match.
+**trg_generate_accounting_entries()**: Applies accounting rules based on order type (Venta, Garantia, Intercambio, Obsequio), product category, and location (sucursal). Supports multiple entries per order item when multiple rules match.
 
 **process_order_dispatch()**: Executes when warehouse_status changes to 'despachado'. Creates inventory_movements for the main product and all components, updates reserved quantities, sets dispatch_date.
+
+**notify_push_to_shopify_on_items()**: Triggers asynchronous HTTP call to push-order-to-shopify Edge Function when phone order items are inserted. Uses pg_net extension for non-blocking execution.
 
 ---
 
@@ -181,13 +227,13 @@ Composite products—those assembled from multiple components—rely on the prod
 
 ```
 product_recipes
-├── recipe_id (UUID)
-├── product_item_id (FK → products.item_id)  -- The composite product
-├── element_item_id (FK → products.item_id)  -- The component
-├── quantity_per_product (NUMERIC)           -- How many per unit sold
-├── recipe_type (VARCHAR)                    -- SALIDA, ENTRADA, DESCUENTO
-├── location (VARCHAR)                       -- PR, TP, or NULL (all locations)
-└── is_active (BOOLEAN)
+|-- recipe_id (UUID)
+|-- product_item_id (FK -> products.item_id)  -- The composite product
+|-- element_item_id (FK -> products.item_id)  -- The component
+|-- quantity_per_product (NUMERIC)            -- How many per unit sold
+|-- recipe_type (VARCHAR)                     -- SALIDA, ENTRADA, DESCUENTO
+|-- location (VARCHAR)                        -- PR, TP, or NULL (all locations)
+|-- is_active (BOOLEAN)
 ```
 
 When an order_item is inserted, the trigger queries:
@@ -230,6 +276,15 @@ Inventory tracking extends beyond simple stock counts. The model captures multip
 
 Edge Functions execute on Supabase's Deno runtime, processing incoming webhooks with sub-second latency. The architecture emphasizes idempotency, error handling, and comprehensive logging.
 
+### Function Inventory
+
+| Function | Direction | Trigger | Purpose |
+|----------|-----------|---------|---------|
+| shopify-webhook | Inbound | Shopify orders/create | Process new Shopify orders |
+| shopify-order-fulfilled | Inbound | Shopify orders/fulfilled | Process fulfillment updates |
+| shopify-inventory-update | Inbound | Shopify inventory_levels/update | Sync inventory changes |
+| push-order-to-shopify | Outbound | Database trigger | Push phone orders to Shopify |
+
 ### Common Patterns
 
 **Idempotency Check**: Every webhook handler first verifies whether the event has already been processed:
@@ -259,17 +314,16 @@ const LOCATION_MAP = {
 };
 ```
 
-**UID Generation**: Unique identifiers follow a consistent pattern—uppercase letter prefix followed by alphanumeric characters:
+**Phone Number Formatting**: Mexican phone numbers require country code for Shopify API:
 
 ```typescript
-function generateUid(length) {
-  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const alphabet2 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  let result = alphabet2.charAt(Math.floor(Math.random() * alphabet2.length));
-  for (let i = 0; i < length; i++) {
-    result += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return result;
+const cleanPhone = rawPhone.replace(/[^0-9]/g, '');
+let validPhone = undefined;
+
+if (cleanPhone.length === 10) {
+  validPhone = '+52' + cleanPhone;  // Add Mexico country code
+} else if (cleanPhone.length === 12 && cleanPhone.startsWith('52')) {
+  validPhone = '+' + cleanPhone;
 }
 ```
 
@@ -282,6 +336,7 @@ function generateUid(length) {
 - Supabase service role key authenticates Edge Functions
 - Row Level Security policies control AppSheet access
 - HTTPS encryption for all data transmission
+- Historical order safeguard prevents accidental sync of legacy data
 
 ### Pending Implementation
 
@@ -302,6 +357,37 @@ This should be implemented before production deployment with significant order v
 
 ---
 
+## Soft Delete Architecture
+
+The system implements soft delete patterns for data preservation and audit compliance:
+
+### Orders Table Extensions
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| archived_at | TIMESTAMPTZ | Soft delete timestamp |
+| archived_reason | TEXT | Deletion justification |
+| archived_by | TEXT | User who archived |
+| uploaded_to_shopify | BOOLEAN | Sync status flag |
+| shopify_upload_date | TIMESTAMPTZ | Sync timestamp |
+
+### Helper Functions
+
+```sql
+-- Archive an order (soft delete)
+SELECT archive_order('ERI-TLF-277', 'Test order', 'Ivan Duarte');
+
+-- Restore an archived order
+SELECT restore_order('ERI-TLF-277');
+```
+
+### Views
+
+- `active_orders`: Filters to non-archived orders only
+- `archived_orders`: Shows archived orders for audit
+
+---
+
 ## Performance Characteristics
 
 ### Latency Benchmarks
@@ -312,6 +398,7 @@ This should be implemented before production deployment with significant order v
 | Recipe expansion | 5 minutes (batch) | < 100ms (per item) |
 | Inventory reservation | 5 minutes (batch) | < 50ms (per item) |
 | Accounting entry generation | 5 minutes (batch) | < 100ms (per item) |
+| Phone order push to Shopify | N/A (manual) | < 3 seconds (auto) |
 
 ### Scalability Vectors
 
@@ -325,24 +412,21 @@ PostgreSQL handles the current data volume (44,638 records) with negligible reso
 
 ## Integration Points
 
-### Shopify → Supabase
+### Shopify to Supabase (Inbound)
 
 | Webhook Topic | Edge Function | Tables Affected |
 |---------------|---------------|-----------------|
 | orders/create | shopify-webhook | orders, order_items, order_item_elements, customers, inventory, accounting_entries |
 | orders/fulfilled | shopify-order-fulfilled | orders, dispatch_records |
-| inventory_levels/update | (planned) | inventory |
-| products/create | (planned) | products |
-| customers/create | (planned) | customers |
+| inventory_levels/update | shopify-inventory-update | inventory |
 
-### Supabase → Shopify (Planned)
+### Supabase to Shopify (Outbound)
 
-| Trigger | API Call | Purpose |
-|---------|----------|---------|
-| inventory UPDATE | Inventory API | Sync stock levels to storefront |
-| products UPDATE | Products API | Sync product data changes |
+| Trigger | Edge Function | Purpose |
+|---------|---------------|---------|
+| trg_auto_push_on_item_insert | push-order-to-shopify | Sync phone orders to Shopify |
 
-### AppSheet → Supabase
+### AppSheet to Supabase
 
 AppSheet connects via PostgreSQL connector, reading from views and writing to tables with appropriate RLS policies. Key interfaces:
 
@@ -357,12 +441,13 @@ AppSheet connects via PostgreSQL connector, reading from views and writing to ta
 
 The architecture establishes extensibility as a core principle. New webhooks follow established patterns. Additional business logic integrates as triggers. Frontend interfaces connect through the same PostgreSQL layer that powers AppSheet.
 
-Immediate enhancement opportunities include HMAC validation for webhook security, bidirectional Shopify synchronization for inventory levels, and the Next.js administrative dashboard outlined in the system design. Each builds upon the foundation without requiring architectural revision.
+Immediate enhancement opportunities include HMAC validation for webhook security, order update synchronization, and the Next.js administrative dashboard outlined in the system design. Each builds upon the foundation without requiring architectural revision.
 
 For engineers extending this system: the patterns are deliberate. Edge Functions handle external boundaries, triggers manage internal consistency, and PostgreSQL serves as the single source of truth. Respect these boundaries, and the system will scale with the business.
 
 ---
 
-*Document Version: 1.0*  
-*System Version: 2.0*  
+*Document Version: 1.1*
+*System Version: 2.0*
+*Last Updated: November 28, 2025*
 *Author: Ivan Duarte, Full Stack Developer*
