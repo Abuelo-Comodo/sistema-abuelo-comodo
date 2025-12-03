@@ -15,7 +15,7 @@ This document details the implementation, configuration, and operational charact
 ## Architecture Overview
 
 ```
-SHOPIFY WEBHOOK                              POSTGRESQL TRIGGER
+SHOPIFY WEBHOOKS                             POSTGRESQL TRIGGERS
       |                                             |
       v                                             v
 +-----------------------------------------------------------+
@@ -30,6 +30,16 @@ SHOPIFY WEBHOOK                              POSTGRESQL TRIGGER
 |  | shopify-         |  | push-order-to-shopify  |          |
 |  | inventory-update |  | (phone orders out)     |          |
 |  +------------------+  +------------------------+          |
+|                                                            |
+|  +------------------+  +------------------------+          |
+|  | hyper-processor  |  | sync-klaviyo-profile   |          |
+|  | (products/*)     |  | (customer sync)        |          |
+|  +------------------+  +------------------------+          |
+|                                                            |
+|  +------------------+                                      |
+|  | send-alert-email |                                      |
+|  | (notifications)  |                                      |
+|  +------------------+                                      |
 |            |                       |                       |
 |            v                       v                       |
 |  +---------------------------------------------------+    |
@@ -38,7 +48,8 @@ SHOPIFY WEBHOOK                              POSTGRESQL TRIGGER
 +-----------------------------------------------------------+
       |                                             |
       v                                             v
-POSTGRESQL (triggers execute)              SHOPIFY ADMIN API
+POSTGRESQL (triggers execute)              EXTERNAL APIs
+                                    (Shopify, Klaviyo, Resend)
 ```
 
 ### Runtime Environment
@@ -58,6 +69,20 @@ POSTGRESQL (triggers execute)              SHOPIFY ADMIN API
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 ```
+
+---
+
+## Function Inventory
+
+| Function | Direction | Webhook/Trigger | Purpose |
+|----------|-----------|-----------------|---------|
+| shopify-webhook | Inbound | orders/create | Process new Shopify orders |
+| shopify-order-fulfilled | Inbound | orders/fulfilled | Process fulfillment updates |
+| shopify-inventory-update | Inbound | inventory_levels/update | Sync inventory changes |
+| hyper-processor | Inbound | products/* | Sync product catalog |
+| push-order-to-shopify | Outbound | Database trigger | Push phone orders to Shopify |
+| sync-klaviyo-profile | Outbound | Database trigger | Sync customers to Klaviyo |
+| send-alert-email | Internal | Called by functions | Send failure notifications |
 
 ---
 
@@ -297,8 +322,144 @@ POST https://{project-ref}.supabase.co/functions/v1/shopify-order-fulfilled
   "success": true,
   "order_id": "7654321098765",
   "dispatch_records_created": 5,
-  "component_records_created": 12,
-  "processing_time_ms": 187
+  "processing_time_ms": 156
+}
+```
+
+#### Order Not Found (500)
+
+```json
+{
+  "success": false,
+  "error": "Order not found: 7654321098765",
+  "processing_time_ms": 23
+}
+```
+
+---
+
+## Function: hyper-processor
+
+### Purpose
+
+Processes Shopify product webhooks (create, update, delete), maintaining synchronization between the Shopify catalog and the Supabase products table. This eliminates the manual product entry workflow that previously required creating entries in Google Sheets and AppSheet.
+
+### Endpoint
+
+```
+POST https://{project-ref}.supabase.co/functions/v1/hyper-processor
+```
+
+### Shopify Configuration
+
+| Setting | Value |
+|---------|-------|
+| Webhook Topics | products/create, products/update, products/delete |
+| Format | JSON |
+| API Version | 2024-01 (or current) |
+| JWT Verification | DISABLED (Shopify does not send JWT) |
+
+### Request Flow
+
+```
+1. RECEIVE webhook payload from Shopify
+      |
+2. PARSE JSON body
+      |
+3. DETECT event type
+      |  |-- Has variants and title: CREATE or UPDATE
+      |  |-- No variants, no title: DELETE
+      |
+4. FOR EACH variant:
+      |
+      IF SKU missing:
+      |  |-- Log warning, skip variant
+      |  |-- Continue to next variant
+      |
+      IF CREATE/UPDATE:
+      |  |-- Strip HTML from description
+      |  |-- Map Shopify fields to Supabase columns
+      |  |-- UPSERT into products table
+      |  |-- Initialize inventory for PR and TP locations
+      |
+      IF DELETE:
+      |  |-- UPDATE products SET status = 'Inactivo'
+      |  |-- Preserve referential integrity
+      |
+5. RETURN success response with processing summary
+```
+
+### Data Mapping
+
+#### Shopify to Supabase Field Mapping
+
+| Shopify Field | Supabase Column | Notes |
+|---------------|-----------------|-------|
+| variant.sku | item_id | Primary identifier (required) |
+| variant.sku | sku | Duplicate for compatibility |
+| title + variant.title | name | Combined if variant title exists |
+| title + variant.title | inventory_name | Same as name |
+| body_html | description | HTML stripped, max 500 chars |
+| variant.price | sale_price | Decimal |
+| variant.compare_at_price | purchase_cost | Decimal |
+| status | status | 'active' to 'Activo', else 'Inactivo' |
+| image.src | image_url | First image URL |
+| id | shopify_product_id | Shopify product ID |
+| variant.id | shopify_variant_id | Shopify variant ID |
+| variant.inventory_item_id | shopify_inventory_item_id | For inventory sync |
+
+#### Auto-Generated Fields
+
+| Field | Value |
+|-------|-------|
+| is_composite | false |
+| reorder_point | 5 |
+| reorder_quantity | 10 |
+| created_at | Current timestamp |
+| updated_at | Current timestamp |
+
+#### Inventory Initialization
+
+When a product is created, inventory records are automatically initialized:
+
+| Location | location_id | Initial Quantity |
+|----------|-------------|------------------|
+| Playa Regatas (PR) | 21449925 | 0 |
+| Tienda Pilares (TP) | 63600984166 | 0 |
+
+### Soft Delete Implementation
+
+Products are never hard-deleted from the database. When Shopify sends a delete webhook:
+
+1. Webhook payload contains only product ID (no variants, no title)
+2. Function detects delete event by absence of variant data
+3. All products matching `shopify_product_id` update to `status = 'Inactivo'`
+4. Historical data remains intact for orders, inventory, accounting
+
+### Response Schema
+
+#### Success Response (200)
+
+```json
+{
+  "success": true,
+  "event_type": "create",
+  "products_processed": 3,
+  "products_skipped": 1,
+  "skipped_reasons": ["Variant missing SKU"],
+  "processing_time_ms": 234
+}
+```
+
+#### Delete Response (200)
+
+```json
+{
+  "success": true,
+  "event_type": "delete",
+  "shopify_product_id": "8234567890123",
+  "products_deactivated": 2,
+  "processing_time_ms": 89
 }
 ```
 
@@ -308,7 +469,7 @@ POST https://{project-ref}.supabase.co/functions/v1/shopify-order-fulfilled
 
 ### Purpose
 
-Pushes phone orders created in AppSheet/Supabase to Shopify, enabling unified order management and fulfillment tracking. This function completes the bidirectional synchronization between systems.
+Pushes phone orders created in AppSheet to Shopify Admin API, enabling unified order management regardless of sales channel origin.
 
 ### Endpoint
 
@@ -316,166 +477,58 @@ Pushes phone orders created in AppSheet/Supabase to Shopify, enabling unified or
 POST https://{project-ref}.supabase.co/functions/v1/push-order-to-shopify
 ```
 
-### Trigger Mechanism
+### Trigger
 
-This function is called automatically via PostgreSQL trigger when order items are inserted for phone orders:
-
-```sql
--- Trigger on order_items table
-CREATE TRIGGER trg_auto_push_on_item_insert
-AFTER INSERT ON order_items
-FOR EACH ROW
-EXECUTE FUNCTION notify_push_to_shopify_on_items();
-```
-
-The trigger function uses pg_net for asynchronous HTTP calls:
-
-```sql
-CREATE OR REPLACE FUNCTION notify_push_to_shopify_on_items()
-RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM 1 FROM orders o
-  WHERE o.order_id = NEW.order_id
-    AND o.source_type IN ('Telefonico', 'AppSheet')
-    AND o.shopify_order_id IS NULL
-    AND (o.vendedor IS NULL OR o.vendedor != 'Shopify');
-  
-  IF FOUND THEN
-    PERFORM net.http_post(
-      url := 'https://{project-ref}.supabase.co/functions/v1/push-order-to-shopify',
-      headers := jsonb_build_object(
-        'Content-Type', 'application/json',
-        'Authorization', 'Bearer ' || '{anon_key}'
-      ),
-      body := jsonb_build_object('order_id', NEW.order_id)
-    );
-  END IF;
-  
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-```
+Database trigger `trg_auto_push_on_item_insert` on `order_items` table, using pg_net for async HTTP calls.
 
 ### Request Flow
 
 ```
-1. RECEIVE order_id from trigger or manual call
+1. RECEIVE order_id from trigger
       |
-2. FETCH order from Supabase
+2. VALIDATE order exists and has items
+      |  |-- NO: Return error
       |
-3. CHECK safeguards:
-      |  |-- Already uploaded? Return success (idempotent)
-      |  |-- Historical order (pre 2025-11-28)? Reject
-      |  |-- No order items? Reject
+3. CHECK historical safeguard
+      |  |-- Order before 2025-11-28: Reject
       |
-4. BUILD Shopify payload:
-      |  |-- Format phone with +52 country code
-      |  |-- Map line items (variant_id or custom)
-      |  |-- Build shipping address
-      |  |-- Add tags (order_id, vendedor, telefonico)
+4. CHECK already uploaded
+      |  |-- YES: Return "already uploaded"
       |
-5. POST to Shopify Admin API
+5. BUILD Shopify order payload
+      |  |-- Format phone number with +52
+      |  |-- Build line items (variant_id or custom)
+      |  |-- Include shipping address
+      |  |-- Add tags and notes
       |
-6. UPDATE Supabase order:
+6. POST to Shopify Admin API
+      |
+7. UPDATE orders table
       |  |-- shopify_order_id
       |  |-- shopify_order_number
       |  |-- order_number = 'SHO-' + number
       |  |-- uploaded_to_shopify = TRUE
-      |  |-- shopify_upload_date
       |
-7. RETURN success response
+8. RETURN success response
 ```
 
-### Core Implementation
+### Phone Number Formatting
 
-#### Historical Order Safeguard
-
-Prevents accidental sync of legacy orders that already exist in historical data:
+Mexican phone numbers require specific formatting for Shopify API acceptance:
 
 ```typescript
-const GO_LIVE_DATE = new Date('2025-11-28T00:00:00Z');
-const orderCreatedAt = new Date(order.created_at);
-
-if (orderCreatedAt < GO_LIVE_DATE) {
-  return new Response(JSON.stringify({
-    success: false,
-    error: 'Historical orders cannot be pushed to Shopify. Only orders created after 2025-11-28 are allowed.',
-    order_id: orderId,
-    created_at: order.created_at
-  }), { status: 400 });
-}
-```
-
-#### Phone Number Formatting
-
-Mexican phone numbers require +52 country code for Shopify API acceptance:
-
-```typescript
-const rawPhone = order.customer_phone || order.receiver_phone || order.celular || '';
 const cleanPhone = rawPhone.replace(/[^0-9]/g, '');
 let validPhone = undefined;
 
 if (cleanPhone.length === 10) {
-  // Mexican 10-digit number - add country code
   validPhone = '+52' + cleanPhone;
 } else if (cleanPhone.length === 12 && cleanPhone.startsWith('52')) {
-  // Already has country code without +
   validPhone = '+' + cleanPhone;
 } else if (cleanPhone.length === 13 && cleanPhone.startsWith('521')) {
-  // Has country code with mobile prefix
   validPhone = '+' + cleanPhone;
 } else if (cleanPhone.length > 10) {
-  // Some other international format
   validPhone = cleanPhone.startsWith('+') ? cleanPhone : '+' + cleanPhone;
 }
-```
-
-#### Line Item Building
-
-Handles both Shopify-cataloged products and custom items:
-
-```typescript
-for (const item of orderItems) {
-  const variantId = await getShopifyVariantId(shopifyDomain, accessToken, item.item_id);
-  
-  if (variantId) {
-    // Product exists in Shopify - use variant_id
-    lineItems.push({
-      variant_id: variantId,
-      quantity: item.quantity,
-      price: (item.unit_price || 0).toString()
-    });
-  } else {
-    // Product not in Shopify - use custom line item
-    lineItems.push({
-      title: item.item_name || item.item_id,
-      quantity: item.quantity,
-      price: (item.unit_price || 0).toString(),
-      requires_shipping: true
-    });
-  }
-}
-```
-
-#### Shopify Order Payload
-
-```typescript
-const shopifyPayload = {
-  order: {
-    line_items: lineItems,
-    email: order.customer_email || order.receiver_email || undefined,
-    phone: validPhone,
-    financial_status: order.first_payment ? 'paid' : 'pending',
-    fulfillment_status: null,
-    shipping_address: shippingAddress,
-    billing_address: shippingAddress,
-    note: `${order.nota || ''}\nOrden telefonica: ${orderId}\nVendedor: ${order.vendedor || 'N/A'}`.trim(),
-    tags: `telefonico, ${order.vendedor || ''}, ${orderId}`.replace(/,\s*$/, ''),
-    source_name: 'phone',
-    send_receipt: false,
-    send_fulfillment_receipt: false
-  }
-};
 ```
 
 ### Response Schema
@@ -489,8 +542,6 @@ const shopifyPayload = {
   "shopify_order_id": "6286978220134",
   "shopify_order_number": 16062,
   "order_number": "SHO-16062",
-  "customer_id": "uuid-here",
-  "location_id": "21449925",
   "items_count": 1,
   "processing_time_ms": 2854
 }
@@ -503,8 +554,7 @@ const shopifyPayload = {
   "success": true,
   "message": "Order already uploaded to Shopify",
   "order_id": "LAU-TLF-213",
-  "shopify_order_id": "6286978220134",
-  "shopify_order_number": 16062
+  "shopify_order_id": "6286978220134"
 }
 ```
 
@@ -514,20 +564,76 @@ const shopifyPayload = {
 {
   "success": false,
   "error": "Historical orders cannot be pushed to Shopify. Only orders created after 2025-11-28 are allowed.",
-  "order_id": "OLD-TLF-001",
-  "created_at": "2025-09-15T10:30:00Z"
+  "order_id": "OLD-TLF-001"
 }
 ```
 
-#### Error Response (500)
+---
+
+## Function: sync-klaviyo-profile
+
+### Purpose
+
+Synchronizes customer profile data to Klaviyo for marketing automation. Triggered by database changes on the customers table.
+
+### Endpoint
+
+```
+POST https://{project-ref}.supabase.co/functions/v1/sync-klaviyo-profile
+```
+
+### Trigger
+
+Database trigger `trg_sync_klaviyo_profile` on `customers` table.
+
+### Klaviyo API Requirements
+
+| Header | Value |
+|--------|-------|
+| Authorization | Klaviyo-API-Key {api_key} |
+| Content-Type | application/vnd.api+json |
+| Accept | application/vnd.api+json |
+| Revision | 2025-04-15 |
+
+### Response Handling
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| 200/201 | Success | Profile created/updated |
+| 409 | Duplicate | Profile exists, handled by upsert |
+| 401 | Unauthorized | Check API key |
+
+---
+
+## Function: send-alert-email
+
+### Purpose
+
+Sends failure notification emails when Edge Functions encounter errors. Called by other functions in catch blocks.
+
+### Endpoint
+
+```
+POST https://{project-ref}.supabase.co/functions/v1/send-alert-email
+```
+
+### Request Payload
 
 ```json
 {
-  "success": false,
-  "error": "No order items found for this order",
-  "processing_time_ms": 239
+  "function_name": "shopify-webhook",
+  "message": "Error al procesar orden de Shopify",
+  "error_details": {
+    "error": "Column 'ciudad_colonia' not found",
+    "shopify_order_id": "6299069349990",
+    "timestamp": "2025-12-02T16:11:34.650Z"
+  }
 }
 ```
+
+### Email Service
+
+Uses Resend API for email delivery. Without domain verification, only the account owner email receives alerts.
 
 ---
 
@@ -541,29 +647,18 @@ All functions require the following environment variables configured in Supabase
 | SUPABASE_SERVICE_ROLE_KEY | Service role secret key | Supabase Dashboard: Settings > API |
 | SHOPIFY_DOMAIN | Shopify admin domain | abuelo-comodo.myshopify.com |
 | SHOPIFY_ACCESS_TOKEN | Shopify Admin API token | Shopify Admin: Apps > Develop apps |
-
-### Shopify API Configuration
-
-The push-order-to-shopify function requires a custom app in Shopify:
-
-1. Shopify Admin > Settings > Apps and sales channels > Develop apps
-2. Create app: "Supabase Integration"
-3. Configure Admin API scopes:
-   - read_products
-   - write_orders
-   - read_orders
-   - write_customers
-   - read_customers
-4. Install app and copy Admin API access token
+| KLAVIYO_API_KEY | Klaviyo private API key | Klaviyo: Settings > API Keys |
+| RESEND_API_KEY | Resend email API key | Resend Dashboard |
 
 ### Configuration Commands
 
 ```bash
-# Set via Supabase CLI
 supabase secrets set SUPABASE_URL=https://xxxxx.supabase.co
 supabase secrets set SUPABASE_SERVICE_ROLE_KEY=eyJhbGc...
 supabase secrets set SHOPIFY_DOMAIN=abuelo-comodo.myshopify.com
 supabase secrets set SHOPIFY_ACCESS_TOKEN=shpat_xxxxx
+supabase secrets set KLAVIYO_API_KEY=pk_xxxxx
+supabase secrets set RESEND_API_KEY=re_xxxxx
 ```
 
 ---
@@ -581,7 +676,11 @@ supabase secrets set SHOPIFY_ACCESS_TOKEN=shpat_xxxxx
 # Deploy individual function
 supabase functions deploy shopify-webhook
 supabase functions deploy shopify-order-fulfilled
+supabase functions deploy shopify-inventory-update
+supabase functions deploy hyper-processor
 supabase functions deploy push-order-to-shopify
+supabase functions deploy sync-klaviyo-profile
+supabase functions deploy send-alert-email
 
 # Deploy all functions
 supabase functions deploy
@@ -589,6 +688,23 @@ supabase functions deploy
 # Verify deployment
 supabase functions list
 ```
+
+---
+
+## Shopify Webhook Configuration
+
+### Required Webhooks
+
+Configure in Shopify Admin > Settings > Notifications > Webhooks:
+
+| Event | URL | Format |
+|-------|-----|--------|
+| orders/create | https://{ref}.supabase.co/functions/v1/shopify-webhook | JSON |
+| orders/fulfilled | https://{ref}.supabase.co/functions/v1/shopify-order-fulfilled | JSON |
+| inventory_levels/update | https://{ref}.supabase.co/functions/v1/shopify-inventory-update | JSON |
+| products/create | https://{ref}.supabase.co/functions/v1/hyper-processor | JSON |
+| products/update | https://{ref}.supabase.co/functions/v1/hyper-processor | JSON |
+| products/delete | https://{ref}.supabase.co/functions/v1/hyper-processor | JSON |
 
 ---
 
@@ -609,14 +725,14 @@ console.log('Location ID:', shopifyOrder.location_id);
 
 | Message | Meaning |
 |---------|---------|
-| `Order already exists: {id}` | Idempotency check passed, duplicate webhook |
+| `Order already exists: {id}` | Idempotency check passed |
 | `Found existing customer by Shopify ID` | Customer matched |
 | `Created new customer: {id}` | New customer record |
 | `Location mapped: PR -> {location_id}` | Location resolution success |
 | `Order created: {order_number}` | Order insert success |
-| `Triggered push to Shopify for order` | Outbound sync initiated |
-| `Rejecting historical order` | Pre-go-live order blocked |
-| `SKU not found in Shopify, using custom line item` | Product fallback |
+| `Product upserted: {sku}` | Product sync success |
+| `Variant missing SKU, skipping` | Product skipped |
+| `Soft delete: {product_id}` | Product deactivated |
 
 ### pg_net Request Logs
 
@@ -646,6 +762,7 @@ LIMIT 10;
 - Anon key used for trigger-initiated calls (server-side only)
 - HTTPS encryption for all data transmission
 - Historical order safeguard prevents accidental sync
+- JWT verification disabled for Shopify webhooks
 
 ### Pending: HMAC Webhook Validation
 
@@ -686,9 +803,11 @@ if (!verifyShopifyWebhook(body, signature, SHOPIFY_WEBHOOK_SECRET)) {
 |-------|-------|----------|
 | `Schema "net" does not exist` | pg_net extension not enabled | `CREATE EXTENSION IF NOT EXISTS pg_net;` |
 | `Phone is invalid` | Phone number wrong format | Ensure 10+ digits, function adds +52 |
-| `Phone has already been taken` | Duplicate customer phone | Remove phone from customer object |
-| `No order items found` | Trigger fired before items added | Use order_items trigger, not orders |
-| `Historical orders cannot be pushed` | Order predates go-live | Expected behavior for legacy data |
+| `Column not found in schema cache` | Schema mismatch | Verify column names match table |
+| `No order items found` | Trigger fired before items | Use order_items trigger, not orders |
+| `Historical orders cannot be pushed` | Pre-go-live order | Expected behavior for legacy data |
+| `Variant missing SKU` | Product has no SKU in Shopify | Add SKU in Shopify before sync |
+| `409 Conflict` (Klaviyo) | Profile exists | Normal - upsert handles this |
 
 ---
 
@@ -697,11 +816,18 @@ if (!verifyShopifyWebhook(body, signature, SHOPIFY_WEBHOOK_SECRET)) {
 ### Manual Webhook Testing
 
 ```bash
+# Test shopify-webhook
 curl -X POST \
-  https://{project-ref}.supabase.co/functions/v1/push-order-to-shopify \
+  https://{project-ref}.supabase.co/functions/v1/shopify-webhook \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer {anon_key}" \
-  -d '{"order_id": "TEST-TLF-001"}'
+  -d '{"id": 9999999999, "order_number": "TEST", ...}'
+
+# Test hyper-processor (product create)
+curl -X POST \
+  https://{project-ref}.supabase.co/functions/v1/hyper-processor \
+  -H "Content-Type: application/json" \
+  -d '{"id": 123456789, "title": "Test Product", "status": "active", "variants": [{"id": 111, "sku": "TEST-001", "price": "99.00"}]}'
 ```
 
 ### Verify Trigger Configuration
@@ -709,12 +835,12 @@ curl -X POST \
 ```sql
 SELECT tgname, tgrelid::regclass, tgenabled
 FROM pg_trigger 
-WHERE tgname LIKE '%push%' OR tgname LIKE '%shopify%';
+WHERE tgname LIKE '%push%' OR tgname LIKE '%shopify%' OR tgname LIKE '%klaviyo%';
 ```
 
 ---
 
-*Document Version: 1.1*
+*Document Version: 1.2*
 *System Version: 2.0*
-*Last Updated: November 28, 2025*
+*Last Updated: December 3, 2025*
 *Author: Ivan Duarte, Full Stack Developer*
