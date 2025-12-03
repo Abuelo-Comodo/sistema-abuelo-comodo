@@ -18,7 +18,7 @@ The transformation represents more than a technology swap. It embodies a fundame
 
 The system operates within an ecosystem of interconnected platforms, each serving distinct operational functions:
 
-**Shopify** serves as the commercial frontend, managing three distinct sales channels: POS Playa Regatas, POS Tienda Pilares, and the online web store. Orders originate here, triggering the downstream processing pipeline through webhook notifications.
+**Shopify** serves as the commercial frontend, managing three distinct sales channels: POS Playa Regatas, POS Tienda Pilares, and the online web store. Orders originate here, triggering the downstream processing pipeline through webhook notifications. Product catalog changes also propagate bidirectionally between Shopify and the central database.
 
 **AppSheet** provides the operational interface layer, connecting warehouse staff, sales advisors, and administrative users to the underlying data. It reads from and writes to Supabase PostgreSQL directly, replacing the previous Google Sheets dependency.
 
@@ -122,6 +122,41 @@ UPDATE orders SET
 
 This bidirectional synchronization ensures all orders—regardless of origin—appear in Shopify for unified fulfillment management.
 
+### Product Sync Pipeline (Shopify to Supabase)
+
+Product catalog changes in Shopify automatically propagate to the Supabase database, eliminating the manual data entry that previously required creating entries in both Google Sheets and AppSheet:
+
+```
+SHOPIFY (products/create, products/update, products/delete)
+    |
+    v
+EDGE FUNCTION: hyper-processor
+    |
+    |-- Detect event type (create/update/delete)
+    |
+    v
+FOR EACH variant (products may have multiple):
+    |
+    |-- VALIDATE SKU exists (skip if missing)
+    |
+    v
+    IF CREATE/UPDATE:
+    |   |-- Strip HTML from description
+    |   |-- Map Shopify fields to Supabase columns
+    |   |-- UPSERT into products table
+    |   |-- Initialize inventory records for both locations
+    |
+    v
+    IF DELETE:
+    |   |-- Soft delete: SET status = 'Inactivo'
+    |   |-- Preserve historical data integrity
+    |
+    v
+RESPONSE: { success: true, products_processed, skipped }
+```
+
+This pipeline enables single-source product management in Shopify while maintaining the relational structure required for inventory tracking and order processing.
+
 ### Order Fulfillment Pipeline
 
 Shopify's fulfillment notification triggers a parallel processing path:
@@ -202,50 +237,14 @@ The system manages inventory across two physical locations, each mapped to Shopi
 
 | Location | Internal ID | Shopify ID | Code | Purpose |
 |----------|-------------|------------|------|---------|
-| Playa Regatas | 21449925 | 21449925 | PR | Main warehouse |
-| Tienda Pilares | 63600984166 | 63600984166 | TP | Retail store |
+| Playa Regatas | 21449925 | 21449925 | PR | Primary warehouse and showroom |
+| Tienda Pilares | 63600984166 | 63600984166 | TP | Secondary retail location |
 
-Location-aware operations include:
-- Inventory tracking (quantity_on_hand, quantity_reserved, quantity_incoming per location)
-- Recipe selection (some products have location-specific component lists)
-- Accounting rules (different cuenta_contable mappings per sucursal)
-- Order assignment (location_id determines which warehouse fulfills)
-
----
-
-## Recipe Processing Model
-
-Composite products—those assembled from multiple components—rely on the product_recipes table for decomposition. The model supports three recipe types:
-
-| Type | Purpose | Trigger Context |
-|------|---------|-----------------|
-| SALIDA | Components deducted from inventory on sale | order_items INSERT |
-| ENTRADA | Components added to inventory on receipt | purchase_order_items UPDATE |
-| DESCUENTO | Promotional or discount calculations | Accounting rules |
-
-### Recipe Structure
-
-```
-product_recipes
-|-- recipe_id (UUID)
-|-- product_item_id (FK -> products.item_id)  -- The composite product
-|-- element_item_id (FK -> products.item_id)  -- The component
-|-- quantity_per_product (NUMERIC)            -- How many per unit sold
-|-- recipe_type (VARCHAR)                     -- SALIDA, ENTRADA, DESCUENTO
-|-- location (VARCHAR)                        -- PR, TP, or NULL (all locations)
-|-- is_active (BOOLEAN)
-```
-
-When an order_item is inserted, the trigger queries:
-
-```sql
-SELECT * FROM product_recipes
-WHERE product_item_id = NEW.item_id
-  AND UPPER(recipe_type) = 'SALIDA'
-  AND (location = v_location OR location IS NULL);
-```
-
-For products with 15-19 components (common in the catalog), this single INSERT triggers 15-19 corresponding INSERT operations into order_item_elements, each with calculated quantities based on the ordered quantity multiplied by quantity_per_product.
+Location determines:
+- Which inventory records are affected by transactions
+- Which recipe variants apply (some products have location-specific components)
+- Which accounting rules generate entries
+- Which Shopify POS channel processes the sale
 
 ---
 
@@ -284,6 +283,9 @@ Edge Functions execute on Supabase's Deno runtime, processing incoming webhooks 
 | shopify-order-fulfilled | Inbound | Shopify orders/fulfilled | Process fulfillment updates |
 | shopify-inventory-update | Inbound | Shopify inventory_levels/update | Sync inventory changes |
 | push-order-to-shopify | Outbound | Database trigger | Push phone orders to Shopify |
+| hyper-processor | Inbound | Shopify products/* | Sync product catalog changes |
+| sync-klaviyo-profile | Outbound | Database trigger | Sync customer profiles to Klaviyo |
+| send-alert-email | Internal | Edge Functions | Send failure notification emails |
 
 ### Common Patterns
 
@@ -337,6 +339,7 @@ if (cleanPhone.length === 10) {
 - Row Level Security policies control AppSheet access
 - HTTPS encryption for all data transmission
 - Historical order safeguard prevents accidental sync of legacy data
+- JWT verification disabled for Shopify webhooks (Shopify does not send JWT tokens)
 
 ### Pending Implementation
 
@@ -371,6 +374,14 @@ The system implements soft delete patterns for data preservation and audit compl
 | uploaded_to_shopify | BOOLEAN | Sync status flag |
 | shopify_upload_date | TIMESTAMPTZ | Sync timestamp |
 
+### Products Table Soft Delete
+
+Products deleted in Shopify are not removed from the database. Instead, their status is set to 'Inactivo', preserving:
+- Order history referencing the product
+- Inventory movement records
+- Accounting entries
+- Recipe relationships
+
 ### Helper Functions
 
 ```sql
@@ -399,6 +410,7 @@ SELECT restore_order('ERI-TLF-277');
 | Inventory reservation | 5 minutes (batch) | < 50ms (per item) |
 | Accounting entry generation | 5 minutes (batch) | < 100ms (per item) |
 | Phone order push to Shopify | N/A (manual) | < 3 seconds (auto) |
+| Product sync from Shopify | N/A (manual) | < 1 second (auto) |
 
 ### Scalability Vectors
 
@@ -419,12 +431,21 @@ PostgreSQL handles the current data volume (44,638 records) with negligible reso
 | orders/create | shopify-webhook | orders, order_items, order_item_elements, customers, inventory, accounting_entries |
 | orders/fulfilled | shopify-order-fulfilled | orders, dispatch_records |
 | inventory_levels/update | shopify-inventory-update | inventory |
+| products/create | hyper-processor | products, inventory |
+| products/update | hyper-processor | products |
+| products/delete | hyper-processor | products (soft delete) |
 
 ### Supabase to Shopify (Outbound)
 
 | Trigger | Edge Function | Purpose |
 |---------|---------------|---------|
 | trg_auto_push_on_item_insert | push-order-to-shopify | Sync phone orders to Shopify |
+
+### Supabase to Klaviyo (Outbound)
+
+| Trigger | Edge Function | Purpose |
+|---------|---------------|---------|
+| trg_sync_klaviyo_profile | sync-klaviyo-profile | Sync customer profile changes |
 
 ### AppSheet to Supabase
 
@@ -447,7 +468,7 @@ For engineers extending this system: the patterns are deliberate. Edge Functions
 
 ---
 
-*Document Version: 1.1*
+*Document Version: 1.2*
 *System Version: 2.0*
-*Last Updated: November 28, 2025*
+*Last Updated: December 3, 2025*
 *Author: Ivan Duarte, Full Stack Developer*
