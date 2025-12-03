@@ -9,16 +9,17 @@ This document provides troubleshooting procedures for all system components incl
 ## Table of Contents
 
 1. [Quick Diagnostic Commands](#quick-diagnostic-commands)
-2. [Shopify Sync Issues](#shopify-sync-issues)
-3. [Edge Function Errors](#edge-function-errors)
-4. [Database Issues](#database-issues)
-5. [AppSheet Problems](#appsheet-problems)
-6. [Klaviyo Integration](#klaviyo-integration)
-7. [Email Alerts (Resend)](#email-alerts-resend)
-8. [Inventory Discrepancies](#inventory-discrepancies)
-9. [Order Processing Failures](#order-processing-failures)
-10. [Performance Issues](#performance-issues)
-11. [Emergency Procedures](#emergency-procedures)
+2. [Shopify Order Sync Issues](#shopify-order-sync-issues)
+3. [Shopify Product Sync Issues](#shopify-product-sync-issues)
+4. [Edge Function Errors](#edge-function-errors)
+5. [Database Issues](#database-issues)
+6. [AppSheet Problems](#appsheet-problems)
+7. [Klaviyo Integration](#klaviyo-integration)
+8. [Email Alerts (Resend)](#email-alerts-resend)
+9. [Inventory Discrepancies](#inventory-discrepancies)
+10. [Order Processing Failures](#order-processing-failures)
+11. [Performance Issues](#performance-issues)
+12. [Emergency Procedures](#emergency-procedures)
 
 ---
 
@@ -28,23 +29,29 @@ This document provides troubleshooting procedures for all system components incl
 
 ```sql
 -- Check recent orders
-SELECT order_id, order_number, created_at, shopify_order_id, status
+SELECT order_id, order_number, created_at, shopify_order_id, order_status
 FROM orders 
 ORDER BY created_at DESC 
 LIMIT 10;
 
 -- Check for orders missing Shopify sync
-SELECT order_id, order_number, created_at, tipo_de_orden
+SELECT order_id, order_number, created_at, source_type
 FROM orders 
 WHERE shopify_order_id IS NULL 
-AND tipo_de_orden = 'telefónico'
+AND source_type IN ('Telefonico', 'AppSheet')
 AND created_at > NOW() - INTERVAL '24 hours';
 
+-- Check recently synced products
+SELECT item_id, name, shopify_product_id, status, updated_at
+FROM products
+WHERE updated_at > NOW() - INTERVAL '24 hours'
+ORDER BY updated_at DESC;
+
 -- Check inventory levels
-SELECT product_id, product_name, qty_pr, qty_tp, qty_total
+SELECT item_id, name, status
 FROM products 
-WHERE qty_total < 5
-ORDER BY qty_total;
+WHERE status = 'Activo'
+ORDER BY name;
 
 -- Check recent Edge Function activity (via pg_net)
 SELECT * FROM net._http_response 
@@ -77,9 +84,9 @@ ORDER BY tablename;
 
 ---
 
-## Shopify Sync Issues
+## Shopify Order Sync Issues
 
-### Orders Not Syncing to Shopify
+### Orders Not Syncing TO Shopify
 
 **Symptoms:**
 - Phone orders created in AppSheet don't appear in Shopify
@@ -89,15 +96,15 @@ ORDER BY tablename;
 
 1. Check if trigger exists:
 ```sql
-SELECT * FROM pg_trigger WHERE tgname = 'trg_push_order_to_shopify';
+SELECT * FROM pg_trigger WHERE tgname = 'trg_auto_push_on_item_insert';
 ```
 
 2. Check Edge Function logs:
    - Supabase Dashboard > Edge Functions > push-order-to-shopify > Logs
 
-3. Verify order has correct tipo_de_orden:
+3. Verify order has correct source_type:
 ```sql
-SELECT order_id, tipo_de_orden, shopify_order_id 
+SELECT order_id, source_type, shopify_order_id 
 FROM orders 
 WHERE order_number = 'YOUR_ORDER_NUMBER';
 ```
@@ -106,9 +113,9 @@ WHERE order_number = 'YOUR_ORDER_NUMBER';
 
 | Issue | Solution |
 |-------|----------|
-| Trigger disabled | `ALTER TABLE orders ENABLE TRIGGER trg_push_order_to_shopify;` |
-| Missing Shopify credentials | Check Edge Function secrets: SHOPIFY_ACCESS_TOKEN, SHOPIFY_STORE_DOMAIN |
-| Invalid phone number | Phone is now added to order notes, not payload - redeploy Edge Function |
+| Trigger disabled | `ALTER TABLE order_items ENABLE TRIGGER trg_auto_push_on_item_insert;` |
+| Missing Shopify credentials | Check Edge Function secrets: SHOPIFY_ACCESS_TOKEN, SHOPIFY_DOMAIN |
+| Invalid phone number | Phone is now added to order notes, not payload |
 | Product not in Shopify | Verify product has valid `shopify_variant_id` |
 
 ### Orders Not Syncing FROM Shopify
@@ -123,9 +130,16 @@ WHERE order_number = 'YOUR_ORDER_NUMBER';
    - Shopify Admin > Settings > Notifications > Webhooks
 
 2. Verify webhook URL is correct:
-   - `https://irmtfzphtgjigfztbhlv.supabase.co/functions/v1/shopify-webhook`
+   - `https://{project-ref}.supabase.co/functions/v1/shopify-webhook`
 
 3. Check Edge Function logs for shopify-webhook
+
+4. Check for schema mismatches:
+```sql
+SELECT column_name FROM information_schema.columns 
+WHERE table_name = 'orders' 
+ORDER BY column_name;
+```
 
 **Solutions:**
 
@@ -133,31 +147,102 @@ WHERE order_number = 'YOUR_ORDER_NUMBER';
 |-------|----------|
 | Webhook not registered | Re-register webhook in Shopify admin |
 | URL incorrect | Update webhook URL in Shopify |
+| Schema mismatch | Verify Edge Function uses correct column names |
 | Edge Function error | Check logs, redeploy function |
 
-### Inventory Not Updating
+---
+
+## Shopify Product Sync Issues
+
+### Products Not Appearing in Supabase
 
 **Symptoms:**
-- Sales don't reduce inventory
-- Manual adjustments not reflected
+- Products created in Shopify don't appear in Supabase
+- Products table not updating
 
 **Diagnostic Steps:**
 
-1. Check inventory trigger:
+1. Check webhook configuration in Shopify:
+   - Shopify Admin > Settings > Notifications > Webhooks
+   - Verify products/create, products/update, products/delete are configured
+
+2. Verify webhook URL:
+   - `https://{project-ref}.supabase.co/functions/v1/hyper-processor`
+
+3. Check Edge Function logs:
+   - Supabase Dashboard > Edge Functions > hyper-processor > Logs
+
+4. Verify product has SKU in Shopify:
 ```sql
-SELECT * FROM pg_trigger WHERE tgname LIKE '%inventory%';
+-- Check if product exists
+SELECT item_id, name, shopify_product_id, status
+FROM products 
+WHERE shopify_product_id = 'SHOPIFY_PRODUCT_ID';
 ```
 
-2. Verify product recipe:
+**Solutions:**
+
+| Issue | Solution |
+|-------|----------|
+| Webhook not registered | Register products/* webhooks in Shopify |
+| JWT verification enabled | Disable JWT verification (Shopify doesn't send JWT) |
+| Missing SKU | Add SKU to product variant in Shopify |
+| Function not deployed | `supabase functions deploy hyper-processor` |
+
+### Products Not Appearing in AppSheet
+
+**Symptoms:**
+- Product synced to Supabase but not visible in AppSheet
+- New products missing from dropdowns
+
+**Solutions:**
+
+| Issue | Solution |
+|-------|----------|
+| Schema not refreshed | AppSheet > Data > Regenerate Schema |
+| View filter active | Check if view filters by status = 'Activo' |
+| Sync not run | AppSheet > Settings > Sync > Sync Now |
+
+### Product Updates Not Reflecting
+
+**Symptoms:**
+- Price changes in Shopify not appearing in Supabase
+- Product name changes not syncing
+
+**Diagnostic Steps:**
+
+1. Check products/update webhook is configured
+2. Verify Edge Function logs show update events
+3. Check product by SKU:
 ```sql
-SELECT * FROM product_recipes WHERE recipe_product_id = 'PRODUCT_ID';
+SELECT item_id, name, sale_price, updated_at
+FROM products
+WHERE item_id = 'YOUR_SKU';
 ```
 
-3. Check inventory log:
+### Deleted Products Still Active
+
+**Symptoms:**
+- Products deleted in Shopify still show as 'Activo' in Supabase
+
+**Note:** Products are soft-deleted (status set to 'Inactivo'), never hard-deleted.
+
+**Diagnostic Steps:**
+
+1. Check products/delete webhook is configured
+2. Verify Edge Function received delete event
+3. Check product status:
 ```sql
-SELECT * FROM inventory_log 
-WHERE product_id = 'PRODUCT_ID' 
-ORDER BY created_at DESC LIMIT 10;
+SELECT item_id, name, status, shopify_product_id
+FROM products
+WHERE shopify_product_id = 'DELETED_PRODUCT_ID';
+```
+
+**Manual Fix:**
+```sql
+UPDATE products 
+SET status = 'Inactivo', updated_at = NOW()
+WHERE shopify_product_id = 'PRODUCT_ID';
 ```
 
 ---
@@ -190,6 +275,22 @@ ORDER BY created_at DESC LIMIT 10;
 
 ### Function-Specific Issues
 
+#### shopify-webhook
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| "Column not found in schema cache" | Schema mismatch | Verify column names match table |
+| "duplicate order" | Order already exists | Normal - idempotent handling |
+| "customer not found" | Email not in system | Creates new customer automatically |
+
+#### hyper-processor
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| "Variant missing SKU" | Product has no SKU | Add SKU in Shopify |
+| "Failed to upsert product" | Database error | Check column types match |
+| No logs appearing | JWT verification enabled | Disable JWT in function settings |
+
 #### push-order-to-shopify
 
 | Error | Cause | Solution |
@@ -197,13 +298,6 @@ ORDER BY created_at DESC LIMIT 10;
 | "phone is invalid" | Invalid phone format | Phone now in notes, not payload |
 | "variant not found" | Product missing in Shopify | Check shopify_variant_id |
 | "inventory not available" | Out of stock in Shopify | Sync inventory first |
-
-#### shopify-webhook
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| "duplicate order" | Order already exists | Normal - idempotent handling |
-| "customer not found" | Email not in system | Creates new customer automatically |
 
 #### sync-klaviyo-profile
 
@@ -267,6 +361,7 @@ CREATE INDEX idx_orders_order_number ON orders(order_number);
 1. Force sync in AppSheet: Settings > Sync > Sync Now
 2. Check if table is in "Tables" list
 3. Verify PostgreSQL connection string
+4. For new products: Regenerate Schema
 
 ### Formula Errors
 
@@ -356,18 +451,20 @@ curl --request GET \
 ### Diagnose Mismatch
 
 ```sql
--- Compare Supabase vs expected
+-- Check product inventory
 SELECT 
-  p.product_id,
-  p.product_name,
-  p.qty_pr AS supabase_pr,
-  p.qty_tp AS supabase_tp
+  p.item_id,
+  p.name,
+  i.location_id,
+  i.quantity_on_hand,
+  i.quantity_reserved
 FROM products p
-WHERE p.product_id = 'PRODUCT_ID';
+JOIN inventory i ON p.item_id = i.item_id
+WHERE p.item_id = 'PRODUCT_SKU';
 
--- Check inventory log
-SELECT * FROM inventory_log 
-WHERE product_id = 'PRODUCT_ID'
+-- Check inventory movements
+SELECT * FROM inventory_movements 
+WHERE item_id = 'PRODUCT_SKU'
 ORDER BY created_at DESC 
 LIMIT 20;
 ```
@@ -378,7 +475,7 @@ LIMIT 20;
 -- Update triggers recalculation
 UPDATE products 
 SET updated_at = NOW() 
-WHERE product_id = 'PRODUCT_ID';
+WHERE item_id = 'PRODUCT_SKU';
 ```
 
 ---
@@ -389,15 +486,15 @@ WHERE product_id = 'PRODUCT_ID';
 
 ```sql
 -- Check order status
-SELECT order_id, status, shopify_order_id, fulfillment_status
+SELECT order_id, order_status, shopify_order_id, fulfillment_status
 FROM orders 
 WHERE order_number = 'ORDER_NUMBER';
 
 -- Check line items
-SELECT * FROM lineas WHERE order_id = 'ORDER_ID';
+SELECT * FROM order_items WHERE order_id = 'ORDER_ID';
 
 -- Check accounting entries
-SELECT * FROM asientos WHERE order_id = 'ORDER_ID';
+SELECT * FROM accounting_entries WHERE order_id = 'ORDER_ID';
 ```
 
 ### Missing Accounting Entries
@@ -405,7 +502,7 @@ SELECT * FROM asientos WHERE order_id = 'ORDER_ID';
 ```sql
 -- Manually trigger accounting
 UPDATE orders 
-SET status = 'completado', updated_at = NOW()
+SET order_status = 'Compra', updated_at = NOW()
 WHERE order_id = 'ORDER_ID';
 ```
 
@@ -439,8 +536,8 @@ ORDER BY query_start;
 ### Disable All Shopify Sync (Emergency)
 
 ```sql
--- Disable outbound sync
-ALTER TABLE orders DISABLE TRIGGER trg_push_order_to_shopify;
+-- Disable outbound order sync
+ALTER TABLE order_items DISABLE TRIGGER trg_auto_push_on_item_insert;
 
 -- Note: Inbound sync (webhooks) disabled by removing webhook in Shopify admin
 ```
@@ -448,7 +545,7 @@ ALTER TABLE orders DISABLE TRIGGER trg_push_order_to_shopify;
 ### Re-enable Sync
 
 ```sql
-ALTER TABLE orders ENABLE TRIGGER trg_push_order_to_shopify;
+ALTER TABLE order_items ENABLE TRIGGER trg_auto_push_on_item_insert;
 ```
 
 ### Rollback RLS (If Blocking Access)
@@ -497,9 +594,10 @@ Supabase automatically backs up daily. For manual backup:
 | Date | Version | Changes |
 |------|---------|---------|
 | 2025-12-01 | 1.0 | Initial troubleshooting guide |
+| 2025-12-03 | 1.1 | Added hyper-processor product sync troubleshooting |
 
 ---
 
-Document Version: 1.0
-Last Updated: 2025-12-01
-Author: Ivan Duarte - ByteUp LLC
+*Document Version: 1.1*
+*Last Updated: December 3, 2025*
+*Author: Ivan Duarte - ByteUp LLC*
