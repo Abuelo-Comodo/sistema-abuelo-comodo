@@ -142,9 +142,9 @@ This formula:
 3. Grants access only if role is "Admin"
 
 **Applied to views:**
-- Prospectos Telefónicos
+- Prospectos Telefonicos
 - Prospectos UB
-- Calendario órdenes
+- Calendario ordenes
 - Inventario Asesor
 - Pedidos AC
 - All sensitive operational views
@@ -154,42 +154,62 @@ This formula:
 ## Edge Function Security
 
 ### Authentication
+
 All Edge Functions validate requests using:
 - Supabase service_role key for database operations
 - Shopify HMAC validation for webhook endpoints (recommended enhancement)
 
 ### Environment Variables
+
 Sensitive credentials stored as Supabase secrets:
-- SUPABASE_URL
-- SUPABASE_SERVICE_ROLE_KEY
-- SHOPIFY_DOMAIN
-- SHOPIFY_ACCESS_TOKEN
+
+| Variable | Purpose |
+|----------|---------|
+| SUPABASE_URL | Supabase project URL |
+| SUPABASE_SERVICE_ROLE_KEY | Database authentication |
+| SHOPIFY_DOMAIN | Shopify store identifier |
+| SHOPIFY_ACCESS_TOKEN | Shopify Admin API |
+| KLAVIYO_API_KEY | Klaviyo marketing platform |
+| RESEND_API_KEY | Email alert service |
 
 ### Function Permissions
+
 | Function | Access Level | Trigger |
 |----------|--------------|---------|
 | shopify-webhook | Public (webhook) | Shopify order events |
 | shopify-order-fulfilled | Public (webhook) | Shopify fulfillment |
 | shopify-inventory-update | Public (webhook) | Shopify inventory |
+| hyper-processor | Public (webhook) | Shopify product events |
 | push-order-to-shopify | Internal (trigger) | Database trigger via pg_net |
+| sync-klaviyo-profile | Internal (trigger) | Database trigger via pg_net |
+| send-alert-email | Internal | Called by other functions |
+
+### Webhook Security Notes
+
+Shopify webhooks do not include JWT tokens. JWT verification must be disabled for Shopify webhook endpoints. HMAC validation is the recommended security mechanism for Shopify webhooks.
 
 ---
 
 ## Security Recommendations
 
 ### Implemented
+
 - [x] RLS enabled on all production tables
 - [x] Service role policies for Edge Functions
 - [x] Authenticated user policies for future use
 - [x] AppSheet view-level security
 - [x] Environment variable secrets
+- [x] JWT verification disabled for Shopify webhooks
+- [x] Email alerts for function failures
 
 ### Recommended Enhancements
+
 - [ ] HMAC webhook signature validation
 - [ ] Rate limiting on public endpoints
 - [ ] Audit logging for sensitive operations
 - [ ] Periodic backup table cleanup
 - [ ] API key rotation schedule
+- [ ] Resend domain verification for broader alert recipients
 
 ---
 
@@ -199,13 +219,14 @@ Sensitive credentials stored as Supabase secrets:
 
 1. **Immediate:** Rotate Supabase service_role key
 2. **Immediate:** Rotate Shopify access token
-3. **Review:** Check webhook_logs for anomalies
-4. **Review:** Audit user_roles table for unauthorized entries
-5. **Report:** Document incident timeline
+3. **Immediate:** Rotate Klaviyo API key
+4. **Review:** Check webhook_logs for anomalies
+5. **Review:** Audit user_roles table for unauthorized entries
+6. **Report:** Document incident timeline
 
 ### Key Rotation Procedure
 
-1. Generate new keys in Supabase Dashboard
+1. Generate new keys in respective dashboards
 2. Update Edge Function environment variables
 3. Update AppSheet connection if needed
 4. Verify all integrations working
@@ -221,11 +242,12 @@ The Sistema Abuelo Comodo security configuration follows defense-in-depth princi
 2. **Application Layer:** AppSheet view formulas control user access
 3. **Integration Layer:** Service role keys authenticate Edge Functions
 4. **Network Layer:** HTTPS encryption for all communications
+5. **Monitoring Layer:** Email alerts notify on function failures
 
 The "Unrestricted" warnings visible in Supabase dashboard for views and backup tables do not represent security vulnerabilities. The system is secure for production use.
 
 ---
 
-Document Version: 1.0
-Last Updated: 2025-12-01
-Author: Ivan Duarte - ByteUp LLC
+*Document Version: 1.1*
+*Last Updated: December 3, 2025*
+*Author: Ivan Duarte - ByteUp LLC*
