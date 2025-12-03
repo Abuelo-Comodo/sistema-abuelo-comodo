@@ -17,12 +17,12 @@ This project represents a fundamental architectural shift: from polling to webho
 |                         SHOPIFY                                      |
 |                    (POS PR, POS TP, Web)                            |
 +-----------------------------+---------------------------------------+
-                              | webhooks (orders/create, orders/fulfilled)
+                              | webhooks (orders, products, inventory)
                               v
 +---------------------------------------------------------------------+
 |                    SUPABASE EDGE FUNCTIONS                          |
-|         shopify-webhook | shopify-order-fulfilled                   |
-|         push-order-to-shopify (bidirectional sync)                  |
+|    shopify-webhook | shopify-order-fulfilled | hyper-processor      |
+|    push-order-to-shopify | sync-klaviyo-profile | send-alert-email  |
 +-----------------------------+---------------------------------------+
                               | INSERT/UPDATE
                               v
@@ -32,10 +32,10 @@ This project represents a fundamental architectural shift: from polling to webho
 |  | Process Recipes   |  | Reserve Inventory  |  | Generate Acctg   | |
 |  | (order_items)     |  | (order_items)      |  | (order_items)    | |
 |  +-------------------+  +--------------------+  +------------------+ |
-|  +-------------------+                                               |
-|  | Push to Shopify   |  <- Phone orders auto-sync                   |
-|  | (order_items)     |                                               |
-|  +-------------------+                                               |
+|  +-------------------+  +--------------------+                       |
+|  | Push to Shopify   |  | Sync to Klaviyo    |                      |
+|  | (order_items)     |  | (customers)        |                      |
+|  +-------------------+  +--------------------+                       |
 +-----------------------------+---------------------------------------+
                               |
                               v
@@ -57,13 +57,13 @@ This project represents a fundamental architectural shift: from polling to webho
 
 **Trigger-Based Business Logic**: PostgreSQL triggers execute automatically on data changes. When an order item is inserted, the system processes product recipes, reserves inventory, and generates accounting entries—all within a single transaction with guaranteed consistency.
 
-**Bidirectional Shopify Synchronization**: Phone orders created through AppSheet automatically push to Shopify within seconds via database triggers and Edge Functions. All orders—regardless of origin—appear in Shopify for unified fulfillment management.
+**Bidirectional Shopify Synchronization**: Phone orders created through AppSheet automatically push to Shopify within seconds via database triggers and Edge Functions. Product catalog changes in Shopify automatically sync to Supabase. All data flows bidirectionally for unified management.
 
 **Normalized Data Model**: 29 tables with 52 foreign key constraints replace the flat spreadsheet structure. Composite products with up to 19 components are handled through proper relational design rather than string concatenation and formula-based lookups.
 
 **Dual-Location Inventory**: Stock levels track independently across Playa Regatas (PR) and Tienda Pilares (TP), with transfer workflows designed for inter-location movement.
 
-**Soft Delete Architecture**: Orders are archived rather than deleted, preserving audit trails and enabling recovery when needed.
+**Soft Delete Architecture**: Orders and products are archived rather than deleted, preserving audit trails and enabling recovery when needed.
 
 ## Technology Stack
 
@@ -73,6 +73,8 @@ This project represents a fundamental architectural shift: from polling to webho
 | Backend | Edge Functions (Deno/TypeScript) | Webhook processing and API integrations |
 | Frontend | AppSheet | Operational interface |
 | E-commerce | Shopify | Point of sale and online store |
+| Marketing | Klaviyo | Customer profile sync and automation |
+| Alerts | Resend | Email notifications for system failures |
 | Hosting | Supabase Cloud | Managed PostgreSQL and Edge Functions |
 | Extensions | pg_net | Async HTTP calls from triggers |
 
@@ -103,6 +105,7 @@ The schema organizes into logical domains:
 | trg_generate_order_id | orders | INSERT | Generates sequential order IDs by advisor |
 | trg_process_order_dispatch | orders | UPDATE | Processes inventory on fulfillment |
 | trg_update_customer_metrics | orders | INSERT/UPDATE | Maintains customer aggregates |
+| trg_sync_klaviyo_profile | customers | INSERT/UPDATE | Syncs customer profiles to Klaviyo |
 
 ## Edge Functions
 
@@ -111,7 +114,10 @@ The schema organizes into logical domains:
 | shopify-webhook | Inbound | Handles orders/create events from Shopify |
 | shopify-order-fulfilled | Inbound | Handles orders/fulfilled events from Shopify |
 | shopify-inventory-update | Inbound | Handles inventory_levels/update events |
+| hyper-processor | Inbound | Handles products/create, update, delete events |
 | push-order-to-shopify | Outbound | Pushes phone orders to Shopify Admin API |
+| sync-klaviyo-profile | Outbound | Syncs customer profiles to Klaviyo |
+| send-alert-email | Internal | Sends failure notification emails via Resend |
 
 ## Migration Metrics
 
@@ -135,7 +141,11 @@ The schema organizes into logical domains:
 | 02_TECHNICAL_ARCHITECTURE.md | Engineers | System architecture and data flows |
 | 03_DATABASE_REFERENCE.md | Engineers | Schema, triggers, functions reference |
 | 04_EDGE_FUNCTIONS.md | Engineers | Webhook and API implementation details |
-| 05_GUIA_OPERACIONES.md | Operations | Common procedures and troubleshooting |
+| 05_GUIA_OPERACIONES.md | Operations | Common procedures and workflows |
+| 06_SECURITY.md | Engineers | RLS policies and access control |
+| 07_ALERT_SYSTEM.md | Operations | Resend email configuration |
+| 08_KLAVIYO_INTEGRATION.md | Engineers | Klaviyo sync setup |
+| 09_TROUBLESHOOTING.md | Support | Diagnostic guide |
 
 ## Project Status
 
@@ -143,20 +153,22 @@ The schema organizes into logical domains:
 
 - Database schema design and implementation (29 tables, 52 FK constraints)
 - PostgreSQL triggers for automated business logic (19 triggers)
-- Edge Functions for Shopify webhook processing (4 functions)
-- Bidirectional Shopify synchronization for phone orders
+- Edge Functions for Shopify webhook processing (7 functions)
+- Bidirectional Shopify synchronization for orders and products
 - Soft delete architecture with archive/restore functions
 - Prospectos Telefonicos to Orders workflow
 - Data migration from legacy system (44,638 records)
 - AppSheet connectivity to Supabase
+- Klaviyo customer profile synchronization
+- Email alert system for failure notifications
 
 ### Pending Implementation
 
 - HMAC validation for webhook security
-- Additional webhooks (products/create, customers/create)
 - Order update synchronization (edits push to Shopify)
 - Purchase orders data migration
 - Inter-location transfers data migration
+- Resend domain verification for broader alert recipients
 - Next.js admin dashboard (designed, not implemented)
 
 ## The Road Ahead
@@ -177,6 +189,8 @@ For teams extending this system: the patterns are consistent. Edge Functions han
 - Shopify store with webhook permissions and custom app
 - AppSheet connected to Supabase PostgreSQL
 - pg_net extension enabled for async HTTP
+- Klaviyo account for marketing automation
+- Resend account for email alerts
 
 ### Environment Variables (Edge Functions)
 
@@ -185,6 +199,8 @@ SUPABASE_URL=your_supabase_url
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 SHOPIFY_DOMAIN=your-store.myshopify.com
 SHOPIFY_ACCESS_TOKEN=shpat_xxxxx
+KLAVIYO_API_KEY=pk_xxxxx
+RESEND_API_KEY=re_xxxxx
 ```
 
 ### Deploying Edge Functions
@@ -192,7 +208,11 @@ SHOPIFY_ACCESS_TOKEN=shpat_xxxxx
 ```bash
 supabase functions deploy shopify-webhook
 supabase functions deploy shopify-order-fulfilled
+supabase functions deploy shopify-inventory-update
+supabase functions deploy hyper-processor
 supabase functions deploy push-order-to-shopify
+supabase functions deploy sync-klaviyo-profile
+supabase functions deploy send-alert-email
 ```
 
 ### Enabling pg_net Extension
@@ -207,6 +227,7 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 
 **Ivan Duarte**
 Full Stack Developer
+ByteUp LLC
 
 ---
 
